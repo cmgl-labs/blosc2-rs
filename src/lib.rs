@@ -6,16 +6,21 @@ use std::ffi::{c_void, CStr, CString};
 use std::sync::{Arc, OnceLock};
 use std::{io, mem};
 
-pub const BLOSC2_VERSION_DATE: &'static str =
-    unsafe { std::str::from_utf8_unchecked(blosc2_sys::BLOSC2_VERSION_DATE) };
-pub const BLOSC2_VERSION_STRING: &'static str =
-    unsafe { std::str::from_utf8_unchecked(blosc2_sys::BLOSC2_VERSION_STRING) };
+pub const BLOSC2_VERSION_DATE: &str = match std::str::from_utf8(blosc2_sys::BLOSC2_VERSION_DATE) {
+    Ok(s) => s,
+    Err(_) => panic!("BLOSC2_VERSION_DATE is not valid UTF-8"),
+};
+pub const BLOSC2_VERSION_STRING: &str =
+    match std::str::from_utf8(blosc2_sys::BLOSC2_VERSION_STRING) {
+        Ok(s) => s,
+        Err(_) => panic!("BLOSC2_VERSION_STRING is not valid UTF-8"),
+    };
 pub use blosc2_sys::{
     BLOSC2_MAX_DIM, BLOSC2_VERSION_MAJOR, BLOSC2_VERSION_MINOR, BLOSC2_VERSION_RELEASE,
 };
 
-const BLOSC2_GUARD: OnceLock<Arc<Blosc2Guard>> = OnceLock::new();
-const BLOSC2_INIT_FLAG: OnceLock<Arc<Mutex<bool>>> = OnceLock::new();
+static BLOSC2_GUARD: OnceLock<Arc<Blosc2Guard>> = OnceLock::new();
+static BLOSC2_INIT_FLAG: OnceLock<Arc<Mutex<bool>>> = OnceLock::new();
 
 /// Result type used in this library
 pub type Result<T> = std::result::Result<T, Error>;
@@ -468,6 +473,13 @@ pub mod schunk {
     pub struct Chunk {
         pub(crate) chunk: Arc<RwLock<*mut u8>>,
         pub(crate) needs_free: bool,
+        /// When true, the buffer was allocated by Rust's allocator (via `into_boxed_slice`).
+        /// Drop will reconstruct a `Box<[u8]>` to deallocate instead of calling libc::free.
+        rust_allocated: bool,
+        /// Exact byte length of the Rust allocation. Only valid when `rust_allocated` is true.
+        /// Guaranteed to equal the allocation capacity because `from_vec` uses
+        /// `Vec::into_boxed_slice()` which ensures `len == capacity`.
+        alloc_len: usize,
     }
 
     unsafe impl Sync for Chunk {}
@@ -484,10 +496,15 @@ pub mod schunk {
     impl Chunk {
         /// Create a new `Chunk` directly from a pointer, you probably
         /// want `Chunk::from_schunk` instead.
+        ///
+        /// The pointer is assumed to have been allocated by C (malloc). If it was
+        /// allocated by Rust, use `Chunk::from_vec` instead.
         pub fn new(chunk: *mut u8, needs_free: bool) -> Self {
             Self {
                 chunk: Arc::new(RwLock::new(chunk)),
                 needs_free,
+                rust_allocated: false,
+                alloc_len: 0,
             }
         }
 
@@ -504,25 +521,31 @@ pub mod schunk {
         /// ```
         #[inline]
         pub fn from_vec(v: Vec<u8>) -> Result<Self> {
-            let mut v = v;
-            v.shrink_to_fit();
             if let Err(_) = CompressedBufferInfo::try_from(v.as_slice()) {
                 return Err("Appears this buffer is not a valid blosc2 chunk".into());
             }
-            let ptr = v.as_mut_ptr();
-            mem::forget(v);
-            Ok(Self::new(ptr as _, true))
+            // into_boxed_slice guarantees len == capacity (reallocates if needed),
+            // so we can safely reconstruct the Box in Drop with the stored length.
+            let boxed = v.into_boxed_slice();
+            let len = boxed.len();
+            let ptr = Box::into_raw(boxed) as *mut u8;
+            Ok(Self {
+                chunk: Arc::new(RwLock::new(ptr)),
+                needs_free: true,
+                rust_allocated: true,
+                alloc_len: len,
+            })
         }
 
         /// Export this Chunk into a `Vec<u8>`
-        /// Maybe clone underlying vec if it's managed by blosc2
+        /// Always copies into Rust-owned memory to avoid allocator mismatch.
         pub fn into_vec(self) -> Result<Vec<u8>> {
             let info = self.info()?;
+            // SAFETY: Always copy into Rust-owned memory. The underlying buffer may have
+            // been allocated by C malloc (not Rust's allocator), so Vec::from_raw_parts
+            // followed by Drop would corrupt the heap on Windows.
             let buf =
-                unsafe { Vec::from_raw_parts(*self.chunk.write(), info.cbytes(), info.cbytes()) };
-            if !self.needs_free {
-                return Ok(buf.clone());
-            }
+                unsafe { std::slice::from_raw_parts(*self.chunk.read(), info.cbytes()) }.to_vec();
             Ok(buf)
         }
 
@@ -580,21 +603,16 @@ pub mod schunk {
             if mem::size_of::<T>() != cparams.0.typesize as usize {
                 cparams.0.typesize = mem::size_of::<T>() as _;
             }
-            let mut dst = Vec::with_capacity(
-                (len * cparams.0.typesize as usize) + ffi::BLOSC_EXTENDED_HEADER_LENGTH as usize,
-            );
-            let nbytes = unsafe {
+            let capacity =
+                (len * cparams.0.typesize as usize) + ffi::BLOSC_EXTENDED_HEADER_LENGTH as usize;
+            let dst = ffi_write_to_vec(capacity, |ptr, cap| unsafe {
                 ffi::blosc2_chunk_uninit(
                     cparams.0,
                     len as i32 * cparams.0.typesize,
-                    dst.as_mut_ptr() as *mut c_void,
-                    dst.capacity() as i32,
+                    ptr,
+                    cap,
                 )
-            };
-            if nbytes < 0 {
-                return Err("Failed to create uninitialized chunk".into());
-            }
-            unsafe { dst.set_len(nbytes as _) };
+            })?;
             Self::from_vec(dst)
         }
 
@@ -615,22 +633,17 @@ pub mod schunk {
             if mem::size_of::<T>() != cparams.0.typesize as usize {
                 cparams.0.typesize = mem::size_of::<T>() as _;
             }
-            let mut dst = Vec::with_capacity(
-                (len * cparams.0.typesize as usize) + ffi::BLOSC_EXTENDED_HEADER_LENGTH as usize,
-            );
-            let nbytes = unsafe {
+            let capacity =
+                (len * cparams.0.typesize as usize) + ffi::BLOSC_EXTENDED_HEADER_LENGTH as usize;
+            let dst = ffi_write_to_vec(capacity, |ptr, cap| unsafe {
                 ffi::blosc2_chunk_repeatval(
                     cparams.0,
                     len as i32 * cparams.0.typesize,
-                    dst.as_mut_ptr() as _,
-                    dst.capacity() as _,
+                    ptr,
+                    cap,
                     &value as *const T as _,
                 )
-            };
-            if nbytes < 0 {
-                return Err("Failed to create chunk".into());
-            }
-            unsafe { dst.set_len(nbytes as _) };
+            })?;
             Self::from_vec(dst)
         }
 
@@ -651,22 +664,16 @@ pub mod schunk {
             if mem::size_of::<T>() != cparams.0.typesize as usize {
                 cparams.0.typesize = mem::size_of::<T>() as _;
             }
-            let mut dst = Vec::with_capacity(
-                (len * cparams.0.typesize as usize) + ffi::BLOSC_EXTENDED_HEADER_LENGTH as usize,
-            );
-
-            let nbytes = unsafe {
+            let capacity =
+                (len * cparams.0.typesize as usize) + ffi::BLOSC_EXTENDED_HEADER_LENGTH as usize;
+            let dst = ffi_write_to_vec(capacity, |ptr, cap| unsafe {
                 ffi::blosc2_chunk_zeros(
                     cparams.0,
                     len as i32 * cparams.0.typesize,
-                    dst.as_mut_ptr() as _,
-                    dst.capacity() as i32,
+                    ptr,
+                    cap,
                 )
-            };
-            if nbytes < 0 {
-                return Err(Error::Blosc2(Blosc2Error::from(nbytes)));
-            }
-            unsafe { dst.set_len(nbytes as usize) };
+            })?;
             Self::from_vec(dst)
         }
 
@@ -750,6 +757,8 @@ pub mod schunk {
             Ok(Self {
                 chunk: Arc::new(RwLock::new(chunk)),
                 needs_free,
+                rust_allocated: false,
+                alloc_len: 0,
             })
         }
 
@@ -792,7 +801,16 @@ pub mod schunk {
         fn drop(&mut self) {
             // drop if needs freed and this is last strong ref
             if self.needs_free && Arc::strong_count(&self.chunk) == 1 {
-                unsafe { blosc2_sys::libc::free(*self.chunk.write() as _) };
+                let ptr = *self.chunk.write();
+                if self.rust_allocated {
+                    // Buffer came from into_boxed_slice — reconstruct Box<[u8]> and drop
+                    // via Rust's allocator. len == capacity is guaranteed.
+                    let slice = unsafe { std::slice::from_raw_parts_mut(ptr, self.alloc_len) };
+                    drop(unsafe { Box::from_raw(slice) });
+                } else {
+                    // Buffer came from C (blosc2) — free via libc.
+                    unsafe { blosc2_sys::libc::free(ptr as _) };
+                }
             }
         }
     }
@@ -810,24 +828,12 @@ pub mod schunk {
         pub fn new(storage: Storage) -> Self {
             let mut storage = storage;
 
-            // CRITICAL FIX: blosc2 C library divides by typesize internally
-            // Ensure typesize is set in BOTH the Rust struct AND what the C pointer sees
-            if storage.cparams.0.typesize == 0 {
-                storage.cparams.0.typesize = mem::size_of::<f32>() as i32;
-            }
-            // Update the pointer that blosc2_schunk_new will use
+            // Re-establish pointers after move (set_cparams/set_dparams set pointers
+            // that become dangling when Storage is moved into this function)
             storage.inner.cparams = &mut storage.cparams.0 as *mut _;
+            storage.inner.dparams = &mut storage.dparams.0 as *mut _;
 
             let schunk = unsafe { ffi::blosc2_schunk_new(&mut storage.inner) };
-
-            // Double-check: Also set typesize directly in the created schunk
-            // This handles case where blosc2 made a copy of cparams
-            unsafe {
-                if !schunk.is_null() && (*schunk).typesize == 0 {
-                    (*schunk).typesize = mem::size_of::<f32>() as i32;
-                }
-            }
-
             Self(Arc::new(RwLock::new(schunk)))
         }
 
@@ -838,14 +844,14 @@ pub mod schunk {
         }
 
         pub fn frame(&self) -> Result<&[u8]> {
-            unsafe {
-                if (**self.0.read()).frame.is_null() {
-                    return Err(Error::from("schunk frame is null"));
-                }
-                let len = ffi::blosc2_schunk_frame_len(*self.0.read()) as usize;
-                let buf = std::slice::from_raw_parts((**self.0.read()).frame as _, len);
-                Ok(buf)
+            let schunk_ptr = *self.0.read();
+            let frame_ptr = unsafe { (*schunk_ptr).frame };
+            if frame_ptr.is_null() {
+                return Err(Error::from("schunk frame is null"));
             }
+            let len = unsafe { ffi::blosc2_schunk_frame_len(schunk_ptr) } as usize;
+            let buf = unsafe { std::slice::from_raw_parts(frame_ptr as *const u8, len) };
+            Ok(buf)
         }
 
         #[inline]
@@ -866,23 +872,16 @@ pub mod schunk {
                 return Ok(self.inner().nchunks as usize);
             }
             let nbytes = mem::size_of::<T>() * data.len();
-            let typesize = if self.typesize() == 0 {
-                mem::size_of::<f32>()
-            } else {
-                self.typesize()
-            };
+            let typesize = self.typesize();
+            if typesize == 0 {
+                return Err(Error::Other(
+                    "SChunk has typesize 0; cannot append buffer".into(),
+                ));
+            }
             if nbytes % typesize != 0 {
                 let msg = format!("Buffer ({nbytes}) not evenly divisible by typesize: {typesize}");
                 return Err(Error::Other(msg));
             }
-
-            // Fix typesize=0 in the actual schunk before calling C library
-            unsafe {
-                if (**self.0.read()).typesize == 0 {
-                    (**self.0.write()).typesize = mem::size_of::<f32>() as i32;
-                }
-            }
-
             let nchunks = unsafe {
                 ffi::blosc2_schunk_append_buffer(*self.0.read(), data.as_ptr() as _, nbytes as _)
             };
@@ -994,12 +993,41 @@ pub mod schunk {
 
         /// Convenience method to `get_slice_buffer` which will transmute resulting bytes buffer into `Vec<T>` for you.
         /// **NB** This will check T is same size as schunk's typesize so is _fairly_ safe.
-        pub fn get_slice_buffer_as_type<T>(&self, start: usize, stop: usize) -> Result<Vec<T>> {
+        pub fn get_slice_buffer_as_type<T: Copy>(&self, start: usize, stop: usize) -> Result<Vec<T>> {
             if mem::size_of::<T>() != self.typesize() {
                 return Err(Error::from("Size of T does not match schunk typesize"));
             }
-            let buf = self.get_slice_buffer(start, stop)?;
-            Ok(unsafe { mem::transmute(buf) })
+            if mem::align_of::<T>() > mem::align_of::<u8>() {
+                // Vec<u8> may not be aligned for T; copy into a properly-aligned Vec<T>.
+                let buf = self.get_slice_buffer(start, stop)?;
+                let n_elements = buf.len() / mem::size_of::<T>();
+                let mut result = Vec::<T>::with_capacity(n_elements);
+                // SAFETY: buf.len() == n_elements * size_of::<T>() (guaranteed by typesize check
+                // and get_slice_buffer's contract). result has enough capacity.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        buf.as_ptr(),
+                        result.as_mut_ptr() as *mut u8,
+                        buf.len(),
+                    );
+                    result.set_len(n_elements);
+                }
+                Ok(result)
+            } else {
+                // T has alignment 1 (like u8), safe to reinterpret directly.
+                let buf = self.get_slice_buffer(start, stop)?;
+                let n_elements = buf.len() / mem::size_of::<T>();
+                let mut result = Vec::<T>::with_capacity(n_elements);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        buf.as_ptr(),
+                        result.as_mut_ptr() as *mut u8,
+                        buf.len(),
+                    );
+                    result.set_len(n_elements);
+                }
+                Ok(result)
+            }
         }
 
         pub fn get_chunk(&self, nchunk: usize) -> Result<Chunk> {
@@ -1026,7 +1054,10 @@ pub mod schunk {
                 return Ok(vec![]);
             }
 
-            unsafe { ffi::blosc2_schunk_avoid_cframe_free(*self.0.read(), true) };
+            // Do NOT call avoid_cframe_free here: we always copy into Rust
+            // memory below, so blosc2 can still manage its own internal cframe
+            // normally.  If we told it not to free the cframe AND needs_free came
+            // back false (internal pointer), nobody would ever free it → leak.
 
             let mut needs_free = true;
             let mut ptr: *mut u8 = std::ptr::null_mut();
@@ -1036,9 +1067,13 @@ pub mod schunk {
                 return Err(Blosc2Error::from(len as i32).into());
             }
 
-            let mut buf = unsafe { Vec::from_raw_parts(ptr, len as _, len as _) };
-            if !needs_free {
-                buf = buf.clone(); // Clone into new since blosc is about to free this one
+            // SAFETY: Always copy into Rust-owned memory. The original buffer was either:
+            // - An internal cframe pointer (needs_free=false): owned by blosc2, freed on schunk drop
+            // - A C-allocated copy (needs_free=true): allocated by C malloc, not Rust's allocator
+            // In both cases, Vec::from_raw_parts would be wrong because its Drop uses Rust's dealloc.
+            let buf = unsafe { std::slice::from_raw_parts(ptr, len as usize) }.to_vec();
+            if needs_free {
+                unsafe { blosc2_sys::libc::free(ptr as _) };
             }
             Ok(buf)
         }
@@ -1201,7 +1236,7 @@ pub mod schunk {
     }
 }
 
-/// Wrapper to [blosc2_cparams].  
+/// Wrapper to [blosc2_cparams].
 /// Compression parameters.
 ///
 /// A normal way to construct this is using `std::convert::From<&T>(val)`
@@ -1277,11 +1312,7 @@ impl CParams {
 impl Default for CParams {
     #[inline]
     fn default() -> Self {
-        let mut cparams = unsafe { ffi::blosc2_get_blosc2_cparams_defaults() };
-        // Set default typesize to f32 (4 bytes) to prevent divide-by-zero in blosc2 C library
-        if cparams.typesize == 0 {
-            cparams.typesize = mem::size_of::<f32>() as i32;
-        }
+        let cparams = unsafe { ffi::blosc2_get_blosc2_cparams_defaults() };
         Self(cparams)
     }
 }
@@ -1295,7 +1326,7 @@ impl<T> From<&T> for CParams {
     }
 }
 
-/// Wrapper to [blosc2_dparams].  
+/// Wrapper to [blosc2_dparams].
 /// Decompression parameters, normally constructed via `DParams::default()`.
 ///
 /// Example
@@ -1328,7 +1359,7 @@ impl Default for DParams {
     }
 }
 
-/// Wrapper to [blosc2_context].  
+/// Wrapper to [blosc2_context].
 /// Container struct for de/compression ops requiring context when used in multithreaded environments
 ///
 /// [blosc2_context]: blosc2_sys::blosc2_context
@@ -1336,6 +1367,16 @@ impl Default for DParams {
 pub struct Context(pub(crate) *mut ffi::blosc2_context);
 
 impl Context {
+    /// Return an error if the underlying C context pointer is null.
+    /// This can happen if `blosc2_create_cctx` / `blosc2_create_dctx` failed to allocate.
+    #[inline]
+    fn ensure_valid(&self) -> Result<()> {
+        if self.0.is_null() {
+            return Err("Failed to create blosc2 context (NULL pointer)".into());
+        }
+        Ok(())
+    }
+
     /// Get the CParams from this context
     ///
     /// Example
@@ -1484,6 +1525,24 @@ impl TryFrom<*const c_void> for CompressedBufferInfo {
     }
 }
 
+/// Helper: allocate a `Vec<u8>` with the given capacity, pass its pointer and
+/// capacity to an FFI function via the closure, and return the buffer truncated
+/// to the number of bytes actually written.  The closure receives
+/// `(ptr: *mut c_void, capacity: i32)` and must return a byte-count (negative = error).
+#[inline]
+fn ffi_write_to_vec(
+    capacity: usize,
+    f: impl FnOnce(*mut c_void, i32) -> i32,
+) -> Result<Vec<u8>> {
+    let mut dst = Vec::<u8>::with_capacity(capacity);
+    let nbytes = f(dst.as_mut_ptr() as *mut c_void, dst.capacity() as i32);
+    if nbytes < 0 {
+        return Err(Blosc2Error::from(nbytes).into());
+    }
+    unsafe { dst.set_len(nbytes as usize) };
+    Ok(dst)
+}
+
 /// Retrieve a number of elements from a `Chunk`
 ///
 /// Example
@@ -1500,22 +1559,29 @@ impl TryFrom<*const c_void> for CompressedBufferInfo {
 /// ```
 #[inline]
 pub fn getitems<T>(src: &[u8], offset: usize, n_items: usize) -> Result<Vec<T>> {
-    let mut dst = Vec::with_capacity(n_items);
-    let nbytes = unsafe {
+    let capacity_bytes = n_items * mem::size_of::<T>();
+    let buf = ffi_write_to_vec(capacity_bytes, |ptr, cap| unsafe {
         ffi::blosc2_getitem(
             src.as_ptr() as *const c_void,
             src.len() as _,
             offset as _,
             n_items as _,
-            dst.as_mut_ptr() as *mut c_void,
-            (n_items * mem::size_of::<T>()) as i32,
+            ptr,
+            cap,
         )
-    };
-    if nbytes < 0 {
-        return Err(Blosc2Error::from(nbytes).into());
+    })?;
+    // Reinterpret the byte buffer as Vec<T>
+    let n_elements = buf.len() / mem::size_of::<T>();
+    let mut result = Vec::<T>::with_capacity(n_elements);
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            buf.as_ptr(),
+            result.as_mut_ptr() as *mut u8,
+            buf.len(),
+        );
+        result.set_len(n_elements);
     }
-    unsafe { dst.set_len(nbytes as usize / mem::size_of::<T>()) };
-    Ok(dst)
+    Ok(result)
 }
 
 /// Get a list of supported compressors in this build
@@ -1557,11 +1623,24 @@ pub fn compress_into_ctx<T>(src: &[T], dst: &mut [u8], ctx: &mut Context) -> Res
     if src.is_empty() {
         return Ok(0);
     }
+    ctx.ensure_valid()?;
+    let ctx_typesize = ctx.get_cparams()?.get_typesize();
+    if ctx_typesize == 0 {
+        return Err(Error::Other("Context typesize must be non-zero".into()));
+    }
+    // Validate that context typesize matches T (unless T is u8, i.e. raw bytes)
+    if mem::size_of::<T>() != 1 && ctx_typesize != mem::size_of::<T>() {
+        return Err(Error::Other(format!(
+            "Context typesize ({}) does not match size_of::<T>() ({})",
+            ctx_typesize,
+            mem::size_of::<T>()
+        )));
+    }
     let size = unsafe {
         ffi::blosc2_compress_ctx(
             ctx.0,
             src.as_ptr() as *const c_void,
-            (src.len() * ctx.get_cparams()?.get_typesize()) as _,
+            (src.len() * ctx_typesize) as _,
             dst.as_mut_ptr() as *mut c_void,
             dst.len() as _,
         )
@@ -1597,24 +1676,35 @@ pub fn compress<T: 'static>(
     if src.is_empty() {
         return Ok(vec![]);
     }
-    let mut dst = Vec::with_capacity(max_compress_len(src, typesize));
     let typesize = typesize.unwrap_or_else(|| mem::size_of::<T>());
-    set_compressor(codec.unwrap_or_default())?;
+    if typesize == 0 {
+        return Err(Error::Other("typesize must be non-zero".into()));
+    }
+
+    // Use context-based compression for thread safety.
+    // The global blosc2_compress uses a shared context not safe for concurrent calls.
+    let cparams = CParams::from_typesize(typesize)
+        .set_clevel(clevel.unwrap_or_default())
+        .set_filter(filter.unwrap_or_default())
+        .set_codec(codec.unwrap_or_default());
+    let ctx = Context::from(cparams);
+    ctx.ensure_valid()?;
 
     // If input is bytes, but typesize is >1 then we use src len directly
-    // since blosc2_compress want's the length in bytes
+    // since blosc2_compress wants the length in bytes
     let multiplier = (&src[0] as &dyn std::any::Any)
         .downcast_ref::<u8>()
         .map(|_| 1)
         .unwrap_or(typesize);
 
+    let src_bytes = src.len() * multiplier;
+    let mut dst = Vec::with_capacity(src_bytes + ffi::BLOSC2_MAX_OVERHEAD as usize);
+
     let n_bytes = unsafe {
-        ffi::blosc2_compress(
-            clevel.unwrap_or_default() as _,
-            filter.unwrap_or_default() as _,
-            typesize as _,
+        ffi::blosc2_compress_ctx(
+            ctx.0,
             src.as_ptr() as *const c_void,
-            (src.len() * multiplier) as _,
+            src_bytes as _,
             dst.as_mut_ptr() as *mut c_void,
             dst.capacity() as _,
         )
@@ -1641,20 +1731,28 @@ pub fn compress_into<T: 'static>(
         return Ok(0);
     }
     let typesize = typesize.unwrap_or_else(|| mem::size_of::<T>());
-    set_compressor(codec.unwrap_or_default())?;
+    if typesize == 0 {
+        return Err(Error::Other("typesize must be non-zero".into()));
+    }
+
+    // Use context-based compression for thread safety.
+    let cparams = CParams::from_typesize(typesize)
+        .set_clevel(clevel.unwrap_or_default())
+        .set_filter(filter.unwrap_or_default())
+        .set_codec(codec.unwrap_or_default());
+    let ctx = Context::from(cparams);
+    ctx.ensure_valid()?;
 
     // If input is bytes, but typesize is >1 then we use src len directly
-    // since blosc2_compress want's the length in bytes
+    // since blosc2_compress wants the length in bytes
     let multiplier = (&src[0] as &dyn std::any::Any)
         .downcast_ref::<u8>()
         .map(|_| 1)
         .unwrap_or(typesize);
 
     let n_bytes = unsafe {
-        ffi::blosc2_compress(
-            clevel.unwrap_or_default() as _,
-            filter.unwrap_or_default() as _,
-            typesize as _,
+        ffi::blosc2_compress_ctx(
+            ctx.0,
             src.as_ptr() as *const c_void,
             (src.len() * multiplier) as _,
             dst.as_mut_ptr() as *mut c_void,
@@ -1675,6 +1773,7 @@ pub fn decompress_ctx<T>(src: &[u8], ctx: &mut Context) -> Result<Vec<T>> {
     if src.is_empty() {
         return Ok(vec![]);
     }
+    ctx.ensure_valid()?;
     let info = CompressedBufferInfo::try_from(src)?;
     let n_elements = info.nbytes as usize / mem::size_of::<T>();
     let mut dst = Vec::with_capacity(n_elements);
@@ -1702,6 +1801,7 @@ pub fn decompress_into_ctx<T>(src: &[T], dst: &mut [T], ctx: &mut Context) -> Re
     if src.is_empty() {
         return Ok(0);
     }
+    ctx.ensure_valid()?;
     let info = CompressedBufferInfo::try_from(src)?;
     let n_bytes = unsafe {
         ffi::blosc2_decompress_ctx(
@@ -1732,30 +1832,11 @@ pub fn decompress<T>(src: &[u8]) -> Result<Vec<T>> {
     if src.is_empty() {
         return Ok(vec![]);
     }
-
-    // blosc2 plays by bytes, we'll go by however many bytes per element
-    // to set the vec length in actual elements
-    let info = CompressedBufferInfo::try_from(src)?;
-    let n_elements = info.nbytes as usize / mem::size_of::<T>();
-    let mut dst = Vec::with_capacity(n_elements);
-
-    let n_bytes = unsafe {
-        ffi::blosc2_decompress(
-            src.as_ptr() as *const c_void,
-            src.len() as i32,
-            dst.as_mut_ptr() as *mut c_void,
-            info.nbytes as _,
-        )
-    };
-
-    if n_bytes < 0 {
-        return Err(Blosc2Error::from(n_bytes).into());
-    }
-
-    debug_assert_eq!(n_bytes as usize, info.nbytes);
-    unsafe { dst.set_len(n_elements) };
-
-    Ok(dst)
+    // Use context-based decompression for thread safety.
+    // The global blosc2_decompress uses a shared context not safe for concurrent calls.
+    let mut ctx = Context::from(DParams::default());
+    ctx.ensure_valid()?;
+    decompress_ctx(src, &mut ctx)
 }
 
 #[inline]
@@ -1763,16 +1844,19 @@ pub fn decompress_into<T>(src: &[u8], dst: &mut [T]) -> Result<usize> {
     if src.is_empty() {
         return Ok(0);
     }
+    // Use context-based decompression for thread safety.
     let info = CompressedBufferInfo::try_from(src)?;
+    let ctx = Context::from(DParams::default());
+    ctx.ensure_valid()?;
     let n_bytes = unsafe {
-        ffi::blosc2_decompress(
+        ffi::blosc2_decompress_ctx(
+            ctx.0,
             src.as_ptr() as *const c_void,
             src.len() as i32,
             dst.as_mut_ptr() as *mut c_void,
             info.nbytes as _,
         )
     };
-
     if n_bytes < 0 {
         return Err(Blosc2Error::from(n_bytes).into());
     }
@@ -2093,7 +2177,7 @@ mod tests {
     #[test]
     fn test_get_version_string() -> Result<()> {
         let version = get_version_string()?;
-        assert_eq!(&version, "2.15.1");
+        assert_eq!(&version, "2.23.0");
         Ok(())
     }
 
