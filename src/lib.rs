@@ -882,6 +882,11 @@ pub mod schunk {
             }
             let nbytes = mem::size_of::<T>() * data.len();
             let typesize = self.typesize();
+            if typesize == 0 {
+                return Err(Error::Other(
+                    "SChunk typesize is zero; cannot append buffer".to_string(),
+                ));
+            }
             if nbytes % typesize != 0 {
                 let msg = format!("Buffer ({nbytes}) not evenly divisible by typesize: {typesize}");
                 return Err(Error::Other(msg));
@@ -1029,8 +1034,6 @@ pub mod schunk {
                 return Ok(vec![]);
             }
 
-            unsafe { ffi::blosc2_schunk_avoid_cframe_free(*self.0.read(), true) };
-
             let mut needs_free = true;
             let mut ptr: *mut u8 = std::ptr::null_mut();
             let len =
@@ -1043,6 +1046,8 @@ pub mod schunk {
             // - An internal cframe pointer (needs_free=false): must not be freed by Rust
             // - A C-allocated copy (needs_free=true): allocated by C malloc, not Rust's allocator
             // In both cases, Vec::from_raw_parts is wrong because its Drop uses Rust's dealloc.
+            // Do NOT call avoid_cframe_free(true) here: the SChunk is consumed by this function
+            // and its Drop (blosc2_schunk_free) will correctly release the cframe.
             let buf = unsafe { std::slice::from_raw_parts(ptr, len as usize) }.to_vec();
             if needs_free {
                 unsafe { blosc2_sys::libc::free(ptr as _) };
@@ -1054,15 +1059,17 @@ pub mod schunk {
         /// via normal Rust semantics.
         pub fn from_vec(buf: Vec<u8>) -> Result<Self> {
             let mut buf = buf;
+            // copy=true: blosc2 makes its own C-allocated copy of the buffer.
+            // This avoids an allocator mismatch (Rust-allocated buf freed by C's free()) and
+            // memory leaks from the avoid_cframe_free(true) + mem::forget pattern.
             let schunk =
-                unsafe { ffi::blosc2_schunk_from_buffer(buf.as_mut_ptr(), buf.len() as _, false) };
+                unsafe { ffi::blosc2_schunk_from_buffer(buf.as_mut_ptr(), buf.len() as _, true) };
             if schunk.is_null() {
                 return Err(Error::from(
                     "Failed to get schunk from buffer; might not be valid buffer for schunk",
                 ));
             }
-            unsafe { ffi::blosc2_schunk_avoid_cframe_free(schunk, true) };
-            mem::forget(buf); // blosc2
+            // buf is dropped here; blosc2 owns its own copy and will free it on blosc2_schunk_free.
             Ok(Self(Arc::new(RwLock::new(schunk))))
         }
 
