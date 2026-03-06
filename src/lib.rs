@@ -6,10 +6,15 @@ use std::ffi::{c_void, CStr, CString};
 use std::sync::{Arc, OnceLock};
 use std::{io, mem};
 
-pub const BLOSC2_VERSION_DATE: &'static str =
-    unsafe { std::str::from_utf8_unchecked(blosc2_sys::BLOSC2_VERSION_DATE) };
-pub const BLOSC2_VERSION_STRING: &'static str =
-    unsafe { std::str::from_utf8_unchecked(blosc2_sys::BLOSC2_VERSION_STRING) };
+pub const BLOSC2_VERSION_DATE: &str = match std::str::from_utf8(blosc2_sys::BLOSC2_VERSION_DATE) {
+    Ok(s) => s,
+    Err(_) => panic!("BLOSC2_VERSION_DATE is not valid UTF-8"),
+};
+pub const BLOSC2_VERSION_STRING: &str =
+    match std::str::from_utf8(blosc2_sys::BLOSC2_VERSION_STRING) {
+        Ok(s) => s,
+        Err(_) => panic!("BLOSC2_VERSION_STRING is not valid UTF-8"),
+    };
 pub use blosc2_sys::{
     BLOSC2_MAX_DIM, BLOSC2_VERSION_MAJOR, BLOSC2_VERSION_MINOR, BLOSC2_VERSION_RELEASE,
 };
@@ -598,21 +603,16 @@ pub mod schunk {
             if mem::size_of::<T>() != cparams.0.typesize as usize {
                 cparams.0.typesize = mem::size_of::<T>() as _;
             }
-            let mut dst = Vec::with_capacity(
-                (len * cparams.0.typesize as usize) + ffi::BLOSC_EXTENDED_HEADER_LENGTH as usize,
-            );
-            let nbytes = unsafe {
+            let capacity =
+                (len * cparams.0.typesize as usize) + ffi::BLOSC_EXTENDED_HEADER_LENGTH as usize;
+            let dst = ffi_write_to_vec(capacity, |ptr, cap| unsafe {
                 ffi::blosc2_chunk_uninit(
                     cparams.0,
                     len as i32 * cparams.0.typesize,
-                    dst.as_mut_ptr() as *mut c_void,
-                    dst.capacity() as i32,
+                    ptr,
+                    cap,
                 )
-            };
-            if nbytes < 0 {
-                return Err("Failed to create uninitialized chunk".into());
-            }
-            unsafe { dst.set_len(nbytes as _) };
+            })?;
             Self::from_vec(dst)
         }
 
@@ -633,22 +633,17 @@ pub mod schunk {
             if mem::size_of::<T>() != cparams.0.typesize as usize {
                 cparams.0.typesize = mem::size_of::<T>() as _;
             }
-            let mut dst = Vec::with_capacity(
-                (len * cparams.0.typesize as usize) + ffi::BLOSC_EXTENDED_HEADER_LENGTH as usize,
-            );
-            let nbytes = unsafe {
+            let capacity =
+                (len * cparams.0.typesize as usize) + ffi::BLOSC_EXTENDED_HEADER_LENGTH as usize;
+            let dst = ffi_write_to_vec(capacity, |ptr, cap| unsafe {
                 ffi::blosc2_chunk_repeatval(
                     cparams.0,
                     len as i32 * cparams.0.typesize,
-                    dst.as_mut_ptr() as _,
-                    dst.capacity() as _,
+                    ptr,
+                    cap,
                     &value as *const T as _,
                 )
-            };
-            if nbytes < 0 {
-                return Err("Failed to create chunk".into());
-            }
-            unsafe { dst.set_len(nbytes as _) };
+            })?;
             Self::from_vec(dst)
         }
 
@@ -669,22 +664,16 @@ pub mod schunk {
             if mem::size_of::<T>() != cparams.0.typesize as usize {
                 cparams.0.typesize = mem::size_of::<T>() as _;
             }
-            let mut dst = Vec::with_capacity(
-                (len * cparams.0.typesize as usize) + ffi::BLOSC_EXTENDED_HEADER_LENGTH as usize,
-            );
-
-            let nbytes = unsafe {
+            let capacity =
+                (len * cparams.0.typesize as usize) + ffi::BLOSC_EXTENDED_HEADER_LENGTH as usize;
+            let dst = ffi_write_to_vec(capacity, |ptr, cap| unsafe {
                 ffi::blosc2_chunk_zeros(
                     cparams.0,
                     len as i32 * cparams.0.typesize,
-                    dst.as_mut_ptr() as _,
-                    dst.capacity() as i32,
+                    ptr,
+                    cap,
                 )
-            };
-            if nbytes < 0 {
-                return Err(Error::Blosc2(Blosc2Error::from(nbytes)));
-            }
-            unsafe { dst.set_len(nbytes as usize) };
+            })?;
             Self::from_vec(dst)
         }
 
@@ -855,14 +844,14 @@ pub mod schunk {
         }
 
         pub fn frame(&self) -> Result<&[u8]> {
-            unsafe {
-                if (**self.0.read()).frame.is_null() {
-                    return Err(Error::from("schunk frame is null"));
-                }
-                let len = ffi::blosc2_schunk_frame_len(*self.0.read()) as usize;
-                let buf = std::slice::from_raw_parts((**self.0.read()).frame as _, len);
-                Ok(buf)
+            let schunk_ptr = *self.0.read();
+            let frame_ptr = unsafe { (*schunk_ptr).frame };
+            if frame_ptr.is_null() {
+                return Err(Error::from("schunk frame is null"));
             }
+            let len = unsafe { ffi::blosc2_schunk_frame_len(schunk_ptr) } as usize;
+            let buf = unsafe { std::slice::from_raw_parts(frame_ptr as *const u8, len) };
+            Ok(buf)
         }
 
         #[inline]
@@ -999,12 +988,41 @@ pub mod schunk {
 
         /// Convenience method to `get_slice_buffer` which will transmute resulting bytes buffer into `Vec<T>` for you.
         /// **NB** This will check T is same size as schunk's typesize so is _fairly_ safe.
-        pub fn get_slice_buffer_as_type<T>(&self, start: usize, stop: usize) -> Result<Vec<T>> {
+        pub fn get_slice_buffer_as_type<T: Copy>(&self, start: usize, stop: usize) -> Result<Vec<T>> {
             if mem::size_of::<T>() != self.typesize() {
                 return Err(Error::from("Size of T does not match schunk typesize"));
             }
-            let buf = self.get_slice_buffer(start, stop)?;
-            Ok(unsafe { mem::transmute(buf) })
+            if mem::align_of::<T>() > mem::align_of::<u8>() {
+                // Vec<u8> may not be aligned for T; copy into a properly-aligned Vec<T>.
+                let buf = self.get_slice_buffer(start, stop)?;
+                let n_elements = buf.len() / mem::size_of::<T>();
+                let mut result = Vec::<T>::with_capacity(n_elements);
+                // SAFETY: buf.len() == n_elements * size_of::<T>() (guaranteed by typesize check
+                // and get_slice_buffer's contract). result has enough capacity.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        buf.as_ptr(),
+                        result.as_mut_ptr() as *mut u8,
+                        buf.len(),
+                    );
+                    result.set_len(n_elements);
+                }
+                Ok(result)
+            } else {
+                // T has alignment 1 (like u8), safe to reinterpret directly.
+                let buf = self.get_slice_buffer(start, stop)?;
+                let n_elements = buf.len() / mem::size_of::<T>();
+                let mut result = Vec::<T>::with_capacity(n_elements);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        buf.as_ptr(),
+                        result.as_mut_ptr() as *mut u8,
+                        buf.len(),
+                    );
+                    result.set_len(n_elements);
+                }
+                Ok(result)
+            }
         }
 
         pub fn get_chunk(&self, nchunk: usize) -> Result<Chunk> {
@@ -1499,6 +1517,24 @@ impl TryFrom<*const c_void> for CompressedBufferInfo {
     }
 }
 
+/// Helper: allocate a `Vec<u8>` with the given capacity, pass its pointer and
+/// capacity to an FFI function via the closure, and return the buffer truncated
+/// to the number of bytes actually written.  The closure receives
+/// `(ptr: *mut c_void, capacity: i32)` and must return a byte-count (negative = error).
+#[inline]
+fn ffi_write_to_vec(
+    capacity: usize,
+    f: impl FnOnce(*mut c_void, i32) -> i32,
+) -> Result<Vec<u8>> {
+    let mut dst = Vec::<u8>::with_capacity(capacity);
+    let nbytes = f(dst.as_mut_ptr() as *mut c_void, dst.capacity() as i32);
+    if nbytes < 0 {
+        return Err(Blosc2Error::from(nbytes).into());
+    }
+    unsafe { dst.set_len(nbytes as usize) };
+    Ok(dst)
+}
+
 /// Retrieve a number of elements from a `Chunk`
 ///
 /// Example
@@ -1515,22 +1551,29 @@ impl TryFrom<*const c_void> for CompressedBufferInfo {
 /// ```
 #[inline]
 pub fn getitems<T>(src: &[u8], offset: usize, n_items: usize) -> Result<Vec<T>> {
-    let mut dst = Vec::with_capacity(n_items);
-    let nbytes = unsafe {
+    let capacity_bytes = n_items * mem::size_of::<T>();
+    let buf = ffi_write_to_vec(capacity_bytes, |ptr, cap| unsafe {
         ffi::blosc2_getitem(
             src.as_ptr() as *const c_void,
             src.len() as _,
             offset as _,
             n_items as _,
-            dst.as_mut_ptr() as *mut c_void,
-            (n_items * mem::size_of::<T>()) as i32,
+            ptr,
+            cap,
         )
-    };
-    if nbytes < 0 {
-        return Err(Blosc2Error::from(nbytes).into());
+    })?;
+    // Reinterpret the byte buffer as Vec<T>
+    let n_elements = buf.len() / mem::size_of::<T>();
+    let mut result = Vec::<T>::with_capacity(n_elements);
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            buf.as_ptr(),
+            result.as_mut_ptr() as *mut u8,
+            buf.len(),
+        );
+        result.set_len(n_elements);
     }
-    unsafe { dst.set_len(nbytes as usize / mem::size_of::<T>()) };
-    Ok(dst)
+    Ok(result)
 }
 
 /// Get a list of supported compressors in this build
