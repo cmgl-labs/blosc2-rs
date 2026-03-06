@@ -468,6 +468,12 @@ pub mod schunk {
     pub struct Chunk {
         pub(crate) chunk: Arc<RwLock<*mut u8>>,
         pub(crate) needs_free: bool,
+        /// When true, the buffer was allocated by Rust's allocator (via Vec).
+        /// Drop will reconstruct a Vec to deallocate instead of calling libc::free.
+        rust_allocated: bool,
+        /// Length of the allocation (bytes). Only valid when rust_allocated is true.
+        /// Used to reconstruct the Vec in Drop for proper deallocation.
+        alloc_len: usize,
     }
 
     unsafe impl Sync for Chunk {}
@@ -484,10 +490,15 @@ pub mod schunk {
     impl Chunk {
         /// Create a new `Chunk` directly from a pointer, you probably
         /// want `Chunk::from_schunk` instead.
+        ///
+        /// The pointer is assumed to have been allocated by C (malloc). If it was
+        /// allocated by Rust, use `Chunk::from_vec` instead.
         pub fn new(chunk: *mut u8, needs_free: bool) -> Self {
             Self {
                 chunk: Arc::new(RwLock::new(chunk)),
                 needs_free,
+                rust_allocated: false,
+                alloc_len: 0,
             }
         }
 
@@ -509,9 +520,15 @@ pub mod schunk {
             if let Err(_) = CompressedBufferInfo::try_from(v.as_slice()) {
                 return Err("Appears this buffer is not a valid blosc2 chunk".into());
             }
+            let len = v.len();
             let ptr = v.as_mut_ptr();
             mem::forget(v);
-            Ok(Self::new(ptr as _, true))
+            Ok(Self {
+                chunk: Arc::new(RwLock::new(ptr)),
+                needs_free: true,
+                rust_allocated: true,
+                alloc_len: len,
+            })
         }
 
         /// Export this Chunk into a `Vec<u8>`
@@ -750,6 +767,8 @@ pub mod schunk {
             Ok(Self {
                 chunk: Arc::new(RwLock::new(chunk)),
                 needs_free,
+                rust_allocated: false,
+                alloc_len: 0,
             })
         }
 
@@ -792,7 +811,15 @@ pub mod schunk {
         fn drop(&mut self) {
             // drop if needs freed and this is last strong ref
             if self.needs_free && Arc::strong_count(&self.chunk) == 1 {
-                unsafe { blosc2_sys::libc::free(*self.chunk.write() as _) };
+                let ptr = *self.chunk.write();
+                if self.rust_allocated {
+                    // Buffer came from a Rust Vec — reconstruct and drop via Rust's allocator.
+                    // shrink_to_fit was called in from_vec, so len == capacity.
+                    unsafe { drop(Vec::from_raw_parts(ptr, self.alloc_len, self.alloc_len)) };
+                } else {
+                    // Buffer came from C (blosc2) — free via libc.
+                    unsafe { blosc2_sys::libc::free(ptr as _) };
+                }
             }
         }
     }
@@ -1573,24 +1600,31 @@ pub fn compress<T: 'static>(
     if src.is_empty() {
         return Ok(vec![]);
     }
-    let mut dst = Vec::with_capacity(max_compress_len(src, typesize));
     let typesize = typesize.unwrap_or_else(|| mem::size_of::<T>());
-    set_compressor(codec.unwrap_or_default())?;
+
+    // Use context-based compression for thread safety.
+    // The global blosc2_compress uses a shared context not safe for concurrent calls.
+    let cparams = CParams::from_typesize(typesize)
+        .set_clevel(clevel.unwrap_or_default())
+        .set_filter(filter.unwrap_or_default())
+        .set_codec(codec.unwrap_or_default());
+    let ctx = Context::from(cparams);
 
     // If input is bytes, but typesize is >1 then we use src len directly
-    // since blosc2_compress want's the length in bytes
+    // since blosc2_compress wants the length in bytes
     let multiplier = (&src[0] as &dyn std::any::Any)
         .downcast_ref::<u8>()
         .map(|_| 1)
         .unwrap_or(typesize);
 
+    let src_bytes = src.len() * multiplier;
+    let mut dst = Vec::with_capacity(src_bytes + ffi::BLOSC2_MAX_OVERHEAD as usize);
+
     let n_bytes = unsafe {
-        ffi::blosc2_compress(
-            clevel.unwrap_or_default() as _,
-            filter.unwrap_or_default() as _,
-            typesize as _,
+        ffi::blosc2_compress_ctx(
+            ctx.0,
             src.as_ptr() as *const c_void,
-            (src.len() * multiplier) as _,
+            src_bytes as _,
             dst.as_mut_ptr() as *mut c_void,
             dst.capacity() as _,
         )
@@ -1617,20 +1651,24 @@ pub fn compress_into<T: 'static>(
         return Ok(0);
     }
     let typesize = typesize.unwrap_or_else(|| mem::size_of::<T>());
-    set_compressor(codec.unwrap_or_default())?;
+
+    // Use context-based compression for thread safety.
+    let cparams = CParams::from_typesize(typesize)
+        .set_clevel(clevel.unwrap_or_default())
+        .set_filter(filter.unwrap_or_default())
+        .set_codec(codec.unwrap_or_default());
+    let ctx = Context::from(cparams);
 
     // If input is bytes, but typesize is >1 then we use src len directly
-    // since blosc2_compress want's the length in bytes
+    // since blosc2_compress wants the length in bytes
     let multiplier = (&src[0] as &dyn std::any::Any)
         .downcast_ref::<u8>()
         .map(|_| 1)
         .unwrap_or(typesize);
 
     let n_bytes = unsafe {
-        ffi::blosc2_compress(
-            clevel.unwrap_or_default() as _,
-            filter.unwrap_or_default() as _,
-            typesize as _,
+        ffi::blosc2_compress_ctx(
+            ctx.0,
             src.as_ptr() as *const c_void,
             (src.len() * multiplier) as _,
             dst.as_mut_ptr() as *mut c_void,
@@ -1708,30 +1746,10 @@ pub fn decompress<T>(src: &[u8]) -> Result<Vec<T>> {
     if src.is_empty() {
         return Ok(vec![]);
     }
-
-    // blosc2 plays by bytes, we'll go by however many bytes per element
-    // to set the vec length in actual elements
-    let info = CompressedBufferInfo::try_from(src)?;
-    let n_elements = info.nbytes as usize / mem::size_of::<T>();
-    let mut dst = Vec::with_capacity(n_elements);
-
-    let n_bytes = unsafe {
-        ffi::blosc2_decompress(
-            src.as_ptr() as *const c_void,
-            src.len() as i32,
-            dst.as_mut_ptr() as *mut c_void,
-            info.nbytes as _,
-        )
-    };
-
-    if n_bytes < 0 {
-        return Err(Blosc2Error::from(n_bytes).into());
-    }
-
-    debug_assert_eq!(n_bytes as usize, info.nbytes);
-    unsafe { dst.set_len(n_elements) };
-
-    Ok(dst)
+    // Use context-based decompression for thread safety.
+    // The global blosc2_decompress uses a shared context not safe for concurrent calls.
+    let mut ctx = Context::from(DParams::default());
+    decompress_ctx(src, &mut ctx)
 }
 
 #[inline]
@@ -1739,16 +1757,18 @@ pub fn decompress_into<T>(src: &[u8], dst: &mut [T]) -> Result<usize> {
     if src.is_empty() {
         return Ok(0);
     }
+    // Use context-based decompression for thread safety.
     let info = CompressedBufferInfo::try_from(src)?;
+    let ctx = Context::from(DParams::default());
     let n_bytes = unsafe {
-        ffi::blosc2_decompress(
+        ffi::blosc2_decompress_ctx(
+            ctx.0,
             src.as_ptr() as *const c_void,
             src.len() as i32,
             dst.as_mut_ptr() as *mut c_void,
             info.nbytes as _,
         )
     };
-
     if n_bytes < 0 {
         return Err(Blosc2Error::from(n_bytes).into());
     }
