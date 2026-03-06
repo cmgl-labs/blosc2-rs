@@ -873,6 +873,11 @@ pub mod schunk {
             }
             let nbytes = mem::size_of::<T>() * data.len();
             let typesize = self.typesize();
+            if typesize == 0 {
+                return Err(Error::Other(
+                    "SChunk has typesize 0; cannot append buffer".into(),
+                ));
+            }
             if nbytes % typesize != 0 {
                 let msg = format!("Buffer ({nbytes}) not evenly divisible by typesize: {typesize}");
                 return Err(Error::Other(msg));
@@ -1049,7 +1054,10 @@ pub mod schunk {
                 return Ok(vec![]);
             }
 
-            unsafe { ffi::blosc2_schunk_avoid_cframe_free(*self.0.read(), true) };
+            // Do NOT call avoid_cframe_free here: we always copy into Rust
+            // memory below, so blosc2 can still manage its own internal cframe
+            // normally.  If we told it not to free the cframe AND needs_free came
+            // back false (internal pointer), nobody would ever free it → leak.
 
             let mut needs_free = true;
             let mut ptr: *mut u8 = std::ptr::null_mut();
@@ -1060,9 +1068,9 @@ pub mod schunk {
             }
 
             // SAFETY: Always copy into Rust-owned memory. The original buffer was either:
-            // - An internal cframe pointer (needs_free=false): must not be freed by Rust
+            // - An internal cframe pointer (needs_free=false): owned by blosc2, freed on schunk drop
             // - A C-allocated copy (needs_free=true): allocated by C malloc, not Rust's allocator
-            // In both cases, Vec::from_raw_parts is wrong because its Drop uses Rust's dealloc.
+            // In both cases, Vec::from_raw_parts would be wrong because its Drop uses Rust's dealloc.
             let buf = unsafe { std::slice::from_raw_parts(ptr, len as usize) }.to_vec();
             if needs_free {
                 unsafe { blosc2_sys::libc::free(ptr as _) };
@@ -1616,11 +1624,23 @@ pub fn compress_into_ctx<T>(src: &[T], dst: &mut [u8], ctx: &mut Context) -> Res
         return Ok(0);
     }
     ctx.ensure_valid()?;
+    let ctx_typesize = ctx.get_cparams()?.get_typesize();
+    if ctx_typesize == 0 {
+        return Err(Error::Other("Context typesize must be non-zero".into()));
+    }
+    // Validate that context typesize matches T (unless T is u8, i.e. raw bytes)
+    if mem::size_of::<T>() != 1 && ctx_typesize != mem::size_of::<T>() {
+        return Err(Error::Other(format!(
+            "Context typesize ({}) does not match size_of::<T>() ({})",
+            ctx_typesize,
+            mem::size_of::<T>()
+        )));
+    }
     let size = unsafe {
         ffi::blosc2_compress_ctx(
             ctx.0,
             src.as_ptr() as *const c_void,
-            (src.len() * ctx.get_cparams()?.get_typesize()) as _,
+            (src.len() * ctx_typesize) as _,
             dst.as_mut_ptr() as *mut c_void,
             dst.len() as _,
         )
@@ -1657,6 +1677,9 @@ pub fn compress<T: 'static>(
         return Ok(vec![]);
     }
     let typesize = typesize.unwrap_or_else(|| mem::size_of::<T>());
+    if typesize == 0 {
+        return Err(Error::Other("typesize must be non-zero".into()));
+    }
 
     // Use context-based compression for thread safety.
     // The global blosc2_compress uses a shared context not safe for concurrent calls.
@@ -1708,6 +1731,9 @@ pub fn compress_into<T: 'static>(
         return Ok(0);
     }
     let typesize = typesize.unwrap_or_else(|| mem::size_of::<T>());
+    if typesize == 0 {
+        return Err(Error::Other("typesize must be non-zero".into()));
+    }
 
     // Use context-based compression for thread safety.
     let cparams = CParams::from_typesize(typesize)
