@@ -14,8 +14,8 @@ pub use blosc2_sys::{
     BLOSC2_MAX_DIM, BLOSC2_VERSION_MAJOR, BLOSC2_VERSION_MINOR, BLOSC2_VERSION_RELEASE,
 };
 
-const BLOSC2_GUARD: OnceLock<Arc<Blosc2Guard>> = OnceLock::new();
-const BLOSC2_INIT_FLAG: OnceLock<Arc<Mutex<bool>>> = OnceLock::new();
+static BLOSC2_GUARD: OnceLock<Arc<Blosc2Guard>> = OnceLock::new();
+static BLOSC2_INIT_FLAG: OnceLock<Arc<Mutex<bool>>> = OnceLock::new();
 
 /// Result type used in this library
 pub type Result<T> = std::result::Result<T, Error>;
@@ -515,14 +515,14 @@ pub mod schunk {
         }
 
         /// Export this Chunk into a `Vec<u8>`
-        /// Maybe clone underlying vec if it's managed by blosc2
+        /// Always copies into Rust-owned memory to avoid allocator mismatch.
         pub fn into_vec(self) -> Result<Vec<u8>> {
             let info = self.info()?;
+            // SAFETY: Always copy into Rust-owned memory. The underlying buffer may have
+            // been allocated by C malloc (not Rust's allocator), so Vec::from_raw_parts
+            // followed by Drop would corrupt the heap on Windows.
             let buf =
-                unsafe { Vec::from_raw_parts(*self.chunk.write(), info.cbytes(), info.cbytes()) };
-            if !self.needs_free {
-                return Ok(buf.clone());
-            }
+                unsafe { std::slice::from_raw_parts(*self.chunk.read(), info.cbytes()) }.to_vec();
             Ok(buf)
         }
 
@@ -810,24 +810,12 @@ pub mod schunk {
         pub fn new(storage: Storage) -> Self {
             let mut storage = storage;
 
-            // CRITICAL FIX: blosc2 C library divides by typesize internally
-            // Ensure typesize is set in BOTH the Rust struct AND what the C pointer sees
-            if storage.cparams.0.typesize == 0 {
-                storage.cparams.0.typesize = mem::size_of::<f32>() as i32;
-            }
-            // Update the pointer that blosc2_schunk_new will use
+            // Re-establish pointers after move (set_cparams/set_dparams set pointers
+            // that become dangling when Storage is moved into this function)
             storage.inner.cparams = &mut storage.cparams.0 as *mut _;
+            storage.inner.dparams = &mut storage.dparams.0 as *mut _;
 
             let schunk = unsafe { ffi::blosc2_schunk_new(&mut storage.inner) };
-
-            // Double-check: Also set typesize directly in the created schunk
-            // This handles case where blosc2 made a copy of cparams
-            unsafe {
-                if !schunk.is_null() && (*schunk).typesize == 0 {
-                    (*schunk).typesize = mem::size_of::<f32>() as i32;
-                }
-            }
-
             Self(Arc::new(RwLock::new(schunk)))
         }
 
@@ -866,23 +854,11 @@ pub mod schunk {
                 return Ok(self.inner().nchunks as usize);
             }
             let nbytes = mem::size_of::<T>() * data.len();
-            let typesize = if self.typesize() == 0 {
-                mem::size_of::<f32>()
-            } else {
-                self.typesize()
-            };
+            let typesize = self.typesize();
             if nbytes % typesize != 0 {
                 let msg = format!("Buffer ({nbytes}) not evenly divisible by typesize: {typesize}");
                 return Err(Error::Other(msg));
             }
-
-            // Fix typesize=0 in the actual schunk before calling C library
-            unsafe {
-                if (**self.0.read()).typesize == 0 {
-                    (**self.0.write()).typesize = mem::size_of::<f32>() as i32;
-                }
-            }
-
             let nchunks = unsafe {
                 ffi::blosc2_schunk_append_buffer(*self.0.read(), data.as_ptr() as _, nbytes as _)
             };
@@ -1036,9 +1012,13 @@ pub mod schunk {
                 return Err(Blosc2Error::from(len as i32).into());
             }
 
-            let mut buf = unsafe { Vec::from_raw_parts(ptr, len as _, len as _) };
-            if !needs_free {
-                buf = buf.clone(); // Clone into new since blosc is about to free this one
+            // SAFETY: Always copy into Rust-owned memory. The original buffer was either:
+            // - An internal cframe pointer (needs_free=false): must not be freed by Rust
+            // - A C-allocated copy (needs_free=true): allocated by C malloc, not Rust's allocator
+            // In both cases, Vec::from_raw_parts is wrong because its Drop uses Rust's dealloc.
+            let buf = unsafe { std::slice::from_raw_parts(ptr, len as usize) }.to_vec();
+            if needs_free {
+                unsafe { blosc2_sys::libc::free(ptr as _) };
             }
             Ok(buf)
         }
@@ -1201,7 +1181,7 @@ pub mod schunk {
     }
 }
 
-/// Wrapper to [blosc2_cparams].  
+/// Wrapper to [blosc2_cparams].
 /// Compression parameters.
 ///
 /// A normal way to construct this is using `std::convert::From<&T>(val)`
@@ -1277,11 +1257,7 @@ impl CParams {
 impl Default for CParams {
     #[inline]
     fn default() -> Self {
-        let mut cparams = unsafe { ffi::blosc2_get_blosc2_cparams_defaults() };
-        // Set default typesize to f32 (4 bytes) to prevent divide-by-zero in blosc2 C library
-        if cparams.typesize == 0 {
-            cparams.typesize = mem::size_of::<f32>() as i32;
-        }
+        let cparams = unsafe { ffi::blosc2_get_blosc2_cparams_defaults() };
         Self(cparams)
     }
 }
@@ -1295,7 +1271,7 @@ impl<T> From<&T> for CParams {
     }
 }
 
-/// Wrapper to [blosc2_dparams].  
+/// Wrapper to [blosc2_dparams].
 /// Decompression parameters, normally constructed via `DParams::default()`.
 ///
 /// Example
@@ -1328,7 +1304,7 @@ impl Default for DParams {
     }
 }
 
-/// Wrapper to [blosc2_context].  
+/// Wrapper to [blosc2_context].
 /// Container struct for de/compression ops requiring context when used in multithreaded environments
 ///
 /// [blosc2_context]: blosc2_sys::blosc2_context

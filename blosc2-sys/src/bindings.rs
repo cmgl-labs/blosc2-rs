@@ -106,11 +106,20 @@ pub struct blosc2_stdio_mmap {
     pub fd: ::std::os::raw::c_int,
     pub access_flags: i64,
     pub map_flags: i64,
+    #[cfg(windows)]
+    pub mmap_handle: *mut ::std::os::raw::c_void,
 }
 #[test]
 fn bindgen_test_layout_blosc2_stdio_mmap() {
     const UNINIT: ::std::mem::MaybeUninit<blosc2_stdio_mmap> = ::std::mem::MaybeUninit::uninit();
     let ptr = UNINIT.as_ptr();
+    #[cfg(windows)]
+    assert_eq!(
+        ::std::mem::size_of::<blosc2_stdio_mmap>(),
+        104usize,
+        concat!("Size of: ", stringify!(blosc2_stdio_mmap))
+    );
+    #[cfg(not(windows))]
     assert_eq!(
         ::std::mem::size_of::<blosc2_stdio_mmap>(),
         96usize,
@@ -239,6 +248,17 @@ fn bindgen_test_layout_blosc2_stdio_mmap() {
             stringify!(blosc2_stdio_mmap),
             "::",
             stringify!(map_flags)
+        )
+    );
+    #[cfg(windows)]
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).mmap_handle) as usize - ptr as usize },
+        96usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(blosc2_stdio_mmap),
+            "::",
+            stringify!(mmap_handle)
         )
     );
 }
@@ -1645,6 +1665,7 @@ pub struct blosc2_dparams {
     pub schunk: *mut ::std::os::raw::c_void,
     pub postfilter: blosc2_postfilter_fn,
     pub postparams: *mut blosc2_postfilter_params,
+    pub typesize: i32,
 }
 #[test]
 fn bindgen_test_layout_blosc2_dparams() {
@@ -1652,7 +1673,7 @@ fn bindgen_test_layout_blosc2_dparams() {
     let ptr = UNINIT.as_ptr();
     assert_eq!(
         ::std::mem::size_of::<blosc2_dparams>(),
-        32usize,
+        40usize,
         concat!("Size of: ", stringify!(blosc2_dparams))
     );
     assert_eq!(
@@ -1698,6 +1719,16 @@ fn bindgen_test_layout_blosc2_dparams() {
             stringify!(blosc2_dparams),
             "::",
             stringify!(postparams)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).typesize) as usize - ptr as usize },
+        32usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(blosc2_dparams),
+            "::",
+            stringify!(typesize)
         )
     );
 }
