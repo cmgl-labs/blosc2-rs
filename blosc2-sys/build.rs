@@ -127,7 +127,7 @@ fn main() {
     println!("cargo:rustc-link-lib=static={}", libname);
 
     #[cfg(feature = "shared")]
-    println!("cargo:rustc-link-lib=blosc2");
+    println!("cargo:rustc-link-lib={}", libname);
 
     #[cfg(feature = "regenerate-bindings")]
     {
