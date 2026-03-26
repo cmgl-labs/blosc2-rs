@@ -10,7 +10,9 @@ exclude = [
     ".github/*",
     "benches/*",
     "data/*",
-    "environment.yml",
+    "pixi.toml",
+    "pixi.lock",
+    ".pixi/*",
 ]
 
 [lib]
