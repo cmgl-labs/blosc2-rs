@@ -116,18 +116,21 @@ fn main() {
         }
     }
 
-    #[allow(unused_variables)]
-    let libname = if cfg!(target_os = "windows") {
-        "libblosc2"
-    } else {
-        "blosc2"
-    };
-
+    // On Windows, the cmake build produces `libblosc2.lib` for the static library
+    // (due to PREFIX lib in CMakeLists.txt) but `blosc2.lib` as the import library
+    // for the shared/DLL build. On Unix, the linker auto-prepends `lib`.
     #[cfg(feature = "static")]
-    println!("cargo:rustc-link-lib=static={}", libname);
+    {
+        let libname = if cfg!(target_os = "windows") {
+            "libblosc2"
+        } else {
+            "blosc2"
+        };
+        println!("cargo:rustc-link-lib=static={}", libname);
+    }
 
     #[cfg(feature = "shared")]
-    println!("cargo:rustc-link-lib={}", libname);
+    println!("cargo:rustc-link-lib=blosc2");
 
     #[cfg(feature = "regenerate-bindings")]
     {
